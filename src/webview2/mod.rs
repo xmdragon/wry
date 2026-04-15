@@ -6,7 +6,13 @@ mod drag_drop;
 mod util;
 
 use std::{
-  borrow::Cow, cell::RefCell, collections::HashSet, fmt::Write, fs, path::PathBuf, rc::Rc,
+  borrow::Cow,
+  cell::RefCell,
+  collections::{HashMap, HashSet},
+  fmt::Write,
+  fs,
+  path::PathBuf,
+  rc::Rc,
   sync::mpsc,
 };
 
@@ -40,6 +46,43 @@ const PARENT_SUBCLASS_ID: u32 = WM_USER + 0x64;
 const PARENT_DESTROY_MESSAGE: u32 = WM_USER + 0x65;
 const MAIN_THREAD_DISPATCHER_SUBCLASS_ID: u32 = WM_USER + 0x66;
 static EXEC_MSG_ID: Lazy<u32> = Lazy::new(|| unsafe { RegisterWindowMessageA(s!("Wry::ExecMsg")) });
+
+// Cache `ICoreWebView2Environment` by creation options so repeated
+// InnerWebView::new() against the same `data_directory` reuses a single
+// browser-side Environment instead of spinning up a fresh one each time.
+//
+// Why: without this cache, destroying+rebuilding the WebView (a common
+// recovery pattern in long-running apps — e.g. rotating a scraping profile
+// after hitting rate limits) makes each rebuild call
+// `CreateCoreWebView2EnvironmentWithOptions` again. After enough cycles the
+// accumulation of broker-side Environment objects races their async teardown
+// and the host process crashes with `STATUS_ILLEGAL_INSTRUCTION (0xc000001d)`
+// when a freed callback vtable gets dispatched.
+//
+// Microsoft explicitly recommends reusing one Environment per
+// `(user_data_folder, options)` tuple
+// (https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/environment-controller-core
+// and https://github.com/MicrosoftEdge/WebView2Feedback/issues/522).
+// This cache implements exactly that.
+//
+// Thread-local is intentional: WebView2 is STA-bound and wry only creates
+// WebViews from the main UI thread, so we do not need Mutex-based sharing.
+// The `ICoreWebView2Environment` held by the cache bumps its COM refcount;
+// `InnerWebView::drop` only releases its own reference, not the cached one,
+// so the Environment lives until the process exits.
+#[derive(Hash, PartialEq, Eq, Clone, Debug)]
+struct EnvCacheKey {
+  data_directory: Option<String>,
+  additional_browser_args: String,
+  language: String,
+  browser_extensions_enabled: bool,
+  scroll_bar_style: i32,
+}
+
+thread_local! {
+  static ENVIRONMENT_CACHE: RefCell<HashMap<EnvCacheKey, ICoreWebView2Environment>> =
+    RefCell::new(HashMap::new());
+}
 
 impl From<webview2_com::Error> for Error {
   fn from(err: webview2_com::Error) -> Self {
@@ -284,11 +327,12 @@ impl InnerWebView {
     attributes: &WebViewAttributes,
     pl_attrs: super::PlatformSpecificWebViewAttributes,
   ) -> Result<ICoreWebView2Environment> {
-    let data_directory = attributes
+    let data_directory_string: Option<String> = attributes
       .context
       .as_deref()
       .and_then(|context| context.data_directory())
-      .map(HSTRING::from);
+      .map(|p| p.to_string_lossy().into_owned());
+    let data_directory = data_directory_string.as_deref().map(HSTRING::from);
 
     // additional browser args
     let additional_browser_args = pl_attrs.additional_browser_args.unwrap_or_else(|| {
@@ -321,24 +365,42 @@ impl InnerWebView {
       arguments
     });
 
+    // Resolve the language once so we can put it in the cache key.
+    let language: String = unsafe {
+      let lcid = GetUserDefaultUILanguage();
+      let mut lang = [0; MAX_LOCALE_NAME as usize];
+      LCIDToLocaleName(lcid as u32, Some(&mut lang), LOCALE_ALLOW_NEUTRAL_NAMES);
+      // Trim trailing NULs: LCIDToLocaleName fills a fixed-size buffer.
+      String::from_utf16_lossy(&lang)
+        .trim_end_matches('\0')
+        .to_string()
+    };
+
+    let scroll_bar_style_value = match pl_attrs.scroll_bar_style {
+      ScrollBarStyle::Default => COREWEBVIEW2_SCROLLBAR_STYLE_DEFAULT,
+      ScrollBarStyle::FluentOverlay => COREWEBVIEW2_SCROLLBAR_STYLE_FLUENT_OVERLAY,
+    };
+
+    let cache_key = EnvCacheKey {
+      data_directory: data_directory_string.clone(),
+      additional_browser_args: additional_browser_args.clone(),
+      language: language.clone(),
+      browser_extensions_enabled: pl_attrs.browser_extensions_enabled,
+      scroll_bar_style: scroll_bar_style_value.0,
+    };
+
+    // Fast path: Environment already cached → bump refcount and return.
+    if let Some(env) = ENVIRONMENT_CACHE.with(|cache| cache.borrow().get(&cache_key).cloned()) {
+      return Ok(env);
+    }
+
     let (tx, rx) = mpsc::channel();
     let options = CoreWebView2EnvironmentOptions::default();
     unsafe {
       options.set_additional_browser_arguments(additional_browser_args);
       options.set_are_browser_extensions_enabled(pl_attrs.browser_extensions_enabled);
-
-      // Get user's system language
-      let lcid = GetUserDefaultUILanguage();
-      let mut lang = [0; MAX_LOCALE_NAME as usize];
-      LCIDToLocaleName(lcid as u32, Some(&mut lang), LOCALE_ALLOW_NEUTRAL_NAMES);
-      options.set_language(String::from_utf16_lossy(&lang));
-
-      let scroll_bar_style = match pl_attrs.scroll_bar_style {
-        ScrollBarStyle::Default => COREWEBVIEW2_SCROLLBAR_STYLE_DEFAULT,
-        ScrollBarStyle::FluentOverlay => COREWEBVIEW2_SCROLLBAR_STYLE_FLUENT_OVERLAY,
-      };
-
-      options.set_scroll_bar_style(scroll_bar_style);
+      options.set_language(language);
+      options.set_scroll_bar_style(scroll_bar_style_value);
 
       CreateCoreWebView2EnvironmentWithOptions(
         PCWSTR::null(),
@@ -360,7 +422,14 @@ impl InnerWebView {
       )?;
     }
 
-    webview2_com::wait_with_pump(rx)?
+    let env: ICoreWebView2Environment = webview2_com::wait_with_pump(rx)?.map_err(Error::from)?;
+    // Insert into cache. Clone bumps the COM refcount so the cached entry
+    // stays alive after the caller drops theirs (or after InnerWebView::drop
+    // releases the controller/env held on InnerWebView itself).
+    ENVIRONMENT_CACHE.with(|cache| {
+      cache.borrow_mut().insert(cache_key, env.clone());
+    });
+    Ok(env)
   }
 
   #[inline]
