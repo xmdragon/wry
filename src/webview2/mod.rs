@@ -411,7 +411,7 @@ impl InnerWebView {
         // by manually creating the callback handler and use webview2_com::with_with_bump
         &CreateCoreWebView2EnvironmentCompletedHandler::create(Box::new(
           move |error_code, environment| {
-            let result = (|| {
+            let result: Result<ICoreWebView2Environment> = (|| {
               error_code?;
               environment.ok_or_else(|| windows::core::Error::from(E_POINTER).into())
             })();
@@ -422,7 +422,7 @@ impl InnerWebView {
       )?;
     }
 
-    let env: ICoreWebView2Environment = webview2_com::wait_with_pump(rx)?.map_err(Error::from)?;
+    let env = webview2_com::wait_with_pump(rx)??;
     // Insert into cache. Clone bumps the COM refcount so the cached entry
     // stays alive after the caller drops theirs (or after InnerWebView::drop
     // releases the controller/env held on InnerWebView itself).
